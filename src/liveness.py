@@ -5,45 +5,53 @@ The file is not comma-separated. Each line has six fields split on U+203D:
 
     website<U+203D>url<U+203D>title<U+203D>tags<U+203D>upload_date<U+203D>video_id
 
-What matters is whether `url` still opens. This program never loads the file.
-It draws a stratified sample (or walks every row), sends HEAD, and classifies:
+What matters is whether `url` still opens. Reading the file is cheap. The cost
+is one network round trip per URL, so the probe spends requests where they
+change the answer:
+
+    Neyman allocation   sample size per site is proportional to rows * sqrt(p(1-p)),
+                        so a site that is almost all alive gets few checks
+    early stopping      a site stops once its Wilson interval is within --margin
+    connection reuse    one TLS session per site instead of one handshake per URL
+    adaptive throttle   HTTP 429/503 lowers that site's concurrency; 404/410 never retry
+
+Verdicts:
 
     alive    HTTP 200-399
     dead     HTTP 404 or 410
     unknown  timeout, connection error, 403, 429, 503
 
-503/429 on these hosts is throttling, not a removed video, so those rows stay
-unknown and are retried next run. State is append-only JSONL: stop the process
-and run the same command again to continue.
+Unknown is not dead. The same command again retries only those rows.
 
-Examples:
+    python src/liveness.py --input D:/data/data.csv --per-site 1000 --margin 0.03
+    python src/liveness.py --input D:/data/data.csv --per-site 0
 
-    python src/liveness.py --input D:/data/data.csv --per-site 200
-    python src/liveness.py --input D:/data/data.csv --per-site 0 --workers 8
-
-`--per-site 0` checks every URL. A 24 million row file at ~15 requests/second
-takes on the order of two weeks, so the default is a sample plus an estimate.
-Python 3.8+, standard library only.
+`--per-site 0` checks every URL and disables the margin stop. Python 3.8+,
+standard library only.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import random
+import socket
 import sys
+import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 DELIM = "\u203d"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+THROTTLE = {429, 503}
+DEAD = {404, 410}
 
 
 def classify(status):
@@ -51,25 +59,171 @@ def classify(status):
         return "unknown"
     if 200 <= status < 400:
         return "alive"
-    if status in (404, 410):
+    if status in DEAD:
         return "dead"
     return "unknown"
 
 
-def request_once(url, timeout):
-    req = Request(url, method="HEAD", headers={"User-Agent": UA, "Accept": "text/html"})
+def wilson(alive, decided, z=1.96):
+    """Return (rate, low, high) for a 95% Wilson interval, or None when nothing is decided."""
+    if decided <= 0:
+        return None
+    p = alive / decided
+    denom = 1 + z * z / decided
+    centre = p + z * z / (2 * decided)
+    margin = z * ((p * (1 - p) + z * z / (4 * decided)) / decided) ** 0.5
+    return p, max(0.0, (centre - margin) / denom), min(1.0, (centre + margin) / denom)
+
+
+def allocate(population, budget, pilot, floor):
+    """Neyman allocation: n_i proportional to N_i * sqrt(p_i(1-p_i)).
+
+    Sites with no pilot yet use p=0.5, the variance maximum, so the first pass
+    does not starve an unknown site. Every site gets at least `floor` unless
+    the budget is smaller than the number of sites.
+    """
+    sites = [site for site, rows in population.items() if rows > 0]
+    if not sites or budget <= 0:
+        return {site: 0 for site in population}
+    weights = {}
+    for site in sites:
+        decided = pilot.get(site)
+        if decided is None:
+            p = 0.5
+        else:
+            alive, dead = decided
+            total = alive + dead
+            p = 0.5 if total <= 0 else alive / total
+        weights[site] = population[site] * (p * (1 - p)) ** 0.5
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        share = budget // len(sites)
+        return {site: min(population[site], share) for site in sites}
+
+    base = min(floor, budget // len(sites)) if floor else 0
+    raw = {}
+    for site in sites:
+        wanted = base + (budget - base * len(sites)) * weights[site] / total_weight
+        raw[site] = min(population[site], max(0, int(round(wanted))))
+    # Rounding can miss the budget by a few. Give the remainder to the heaviest sites.
+    short = budget - sum(raw.values())
+    order = sorted(sites, key=lambda s: weights[s], reverse=True)
+    i = 0
+    while short > 0 and any(raw[s] < population[s] for s in sites):
+        site = order[i % len(order)]
+        if raw[site] < population[site]:
+            raw[site] += 1
+            short -= 1
+        i += 1
+        if i > budget * len(sites) + 10:
+            break
+    return raw
+
+
+class ConnectionPool:
+    """A few keep-alive connections per origin. HEAD responses have no body to drain."""
+
+    def __init__(self, per_origin, timeout):
+        self.per_origin = per_origin
+        self.timeout = timeout
+        self._idle = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def _new(self, scheme, host, port):
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=self.timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+        return conn
+
+    def acquire(self, scheme, host, port):
+        key = (scheme, host, port)
+        with self._lock:
+            idle = self._idle[key]
+            if idle:
+                return idle.pop()
+        return self._new(scheme, host, port)
+
+    def release(self, scheme, host, port, conn, reuse):
+        if not reuse:
+            conn.close()
+            return
+        key = (scheme, host, port)
+        with self._lock:
+            idle = self._idle[key]
+            if len(idle) < self.per_origin:
+                idle.append(conn)
+                return
+        conn.close()
+
+    def close(self):
+        with self._lock:
+            groups = list(self._idle.values())
+            self._idle.clear()
+        for group in groups:
+            for conn in group:
+                conn.close()
+
+
+def request_once(url, pool):
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None, "", 0, "BadUrl"
+    host = parts.hostname
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
     started = time.time()
+    conn = pool.acquire(parts.scheme, host, port)
+    reuse = False
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            return int(resp.status), resp.geturl(), int((time.time() - started) * 1000), ""
-    except HTTPError as exc:
-        return int(exc.code), getattr(exc, "url", "") or url, int((time.time() - started) * 1000), ""
+        conn.request("HEAD", target, headers={"User-Agent": UA, "Accept": "text/html", "Connection": "keep-alive"})
+        resp = conn.getresponse()
+        resp.read()
+        reuse = resp.will_close is False
+        elapsed = int((time.time() - started) * 1000)
+        return int(resp.status), parts.scheme + "://" + parts.netloc + (resp.getheader("Location") or ""), elapsed, ""
     except Exception as exc:
-        return None, "", int((time.time() - started) * 1000), type(exc).__name__
+        elapsed = int((time.time() - started) * 1000)
+        return None, "", elapsed, type(exc).__name__
+    finally:
+        pool.release(parts.scheme, host, port, conn, reuse)
 
 
-def sample_urls(path, per_site, seed):
-    """Reservoir-sample `per_site` URLs from each website. per_site <= 0 keeps all."""
+class SiteLimiter:
+    """Per-site concurrency that backs off on throttle responses."""
+
+    def __init__(self, sites, workers):
+        self.limit = {site: max(1, workers) for site in sites}
+        self.inflight = {site: 0 for site in sites}
+        self.throttle_streak = Counter()
+        self._lock = threading.Condition()
+
+    def acquire(self, site):
+        with self._lock:
+            while self.inflight[site] >= self.limit[site]:
+                self._lock.wait(0.05)
+            self.inflight[site] += 1
+
+    def release(self, site, status):
+        with self._lock:
+            self.inflight[site] = max(0, self.inflight[site] - 1)
+            if status in THROTTLE:
+                self.throttle_streak[site] += 1
+                if self.throttle_streak[site] >= 2 and self.limit[site] > 1:
+                    self.limit[site] = max(1, self.limit[site] // 2)
+                    self.throttle_streak[site] = 0
+                    print("throttle {} concurrency={}".format(site, self.limit[site]), file=sys.stderr, flush=True)
+            elif status is not None:
+                self.throttle_streak[site] = 0
+                if self.limit[site] < 32 and status and 200 <= status < 400:
+                    self.limit[site] += 0  # success does not immediately ramp; the next pass starts higher
+            self._lock.notify_all()
+
+
+def sample_urls(path, quotas, seed):
+    """Reservoir-sample up to quotas[site] URLs. A quota of 0 keeps every URL of that site."""
     rng = random.Random(seed)
     buckets = defaultdict(list)
     seen = Counter()
@@ -95,23 +249,39 @@ def sample_urls(path, per_site, seed):
             if not url.startswith("http"):
                 continue
             seen[website] += 1
+            quota = quotas.get(website, 0)
             bucket = buckets[website]
-            if per_site <= 0 or len(bucket) < per_site:
+            if quota <= 0 or len(bucket) < quota:
                 bucket.append(url)
             else:
                 j = rng.randrange(seen[website])
-                if j < per_site:
+                if j < quota:
                     bucket[j] = url
             if rows % 5000000 == 0:
                 elapsed = max(time.time() - started, 0.001)
                 print(
-                    "sample {:,} rows  {:.1f}%  {:.0f} MiB/s".format(
-                        rows, 100.0 * read / size, (read / 1048576) / elapsed
-                    ),
+                    "sample {:,} rows  {:.1f}%  {:.0f} MiB/s".format(rows, 100.0 * read / size, (read / 1048576) / elapsed),
                     file=sys.stderr,
                     flush=True,
                 )
     return dict(seen), {site: list(urls) for site, urls in buckets.items()}
+
+
+def count_population(path):
+    seen = Counter()
+    with open(path, "rb") as fh:
+        fh.readline()
+        for raw in fh:
+            if raw.endswith(b"\n"):
+                raw = raw[:-1]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            if not raw:
+                continue
+            parts = raw.decode("utf-8", errors="replace").split(DELIM)
+            if len(parts) == 6 and parts[1].strip().startswith("http"):
+                seen[parts[0]] += 1
+    return dict(seen)
 
 
 def load_done(path):
@@ -128,22 +298,66 @@ def load_done(path):
     return done
 
 
-def check_all(jobs, results_path, workers, timeout, delay):
+def pilot_from(done):
+    counts = defaultdict(lambda: [0, 0])
+    for (site, _url), row in done.items():
+        verdict = row.get("verdict")
+        if verdict == "alive":
+            counts[site][0] += 1
+        elif verdict == "dead":
+            counts[site][1] += 1
+    return {site: tuple(pair) for site, pair in counts.items()}
+
+
+def check_all(jobs, results_path, workers, timeout, connections, margin, full):
+    """Check URLs until each site is decided within `margin`, or the list runs out.
+
+    `jobs` is a dict of site -> [url]. Already decided rows are skipped. Unknown
+    rows are eligible again. Throttle status lowers that site's concurrency.
+    """
     done = load_done(results_path)
-    pending = []
-    for site, url in jobs:
-        prev = done.get((site, url))
-        if prev is None or prev.get("verdict") == "unknown":
-            pending.append((site, url))
-    print("pending {:,} of {:,}".format(len(pending), len(jobs)), file=sys.stderr, flush=True)
-    if not pending:
+    pending = {}
+    for site, urls in jobs.items():
+        waiting = []
+        for url in urls:
+            prev = done.get((site, url))
+            if prev is None or prev.get("verdict") == "unknown":
+                waiting.append(url)
+        pending[site] = waiting
+    total = sum(len(v) for v in pending.values())
+    print("pending {:,}".format(total), file=sys.stderr, flush=True)
+    if total == 0:
         return done
 
-    def work(item):
-        site, url = item
-        if delay:
-            time.sleep(delay)
-        status, final, ms, error = request_once(url, timeout)
+    pool = ConnectionPool(connections, timeout)
+    per_site_workers = max(1, workers // max(1, len(pending)))
+    limiter = SiteLimiter(list(pending), per_site_workers)
+    stop = set()
+    finished = 0
+    cursors = {site: 0 for site in pending}
+
+    def site_done(site):
+        if full or margin <= 0:
+            return False
+        alive = dead = 0
+        for url in jobs.get(site, []):
+            verdict = done.get((site, url), {}).get("verdict")
+            if verdict == "alive":
+                alive += 1
+            elif verdict == "dead":
+                dead += 1
+        interval = wilson(alive, alive + dead)
+        if interval is None:
+            return False
+        _rate, low, high = interval
+        return (high - low) <= margin and (alive + dead) >= 30
+
+    def work(site, url):
+        limiter.acquire(site)
+        try:
+            status, final, ms, error = request_once(url, pool)
+        finally:
+            limiter.release(site, status)
         return {
             "site": site,
             "url": url,
@@ -155,28 +369,38 @@ def check_all(jobs, results_path, workers, timeout, delay):
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
-    finished = 0
-    with open(results_path, "a", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(work, item) for item in pending]
-        for fut in as_completed(futures):
-            row = fut.result()
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-            fh.flush()
-            done[(row["site"], row["url"])] = row
-            finished += 1
-            if finished % 50 == 0 or finished == len(pending):
-                print("checked {}/{}".format(finished, len(pending)), file=sys.stderr, flush=True)
+    try:
+        with open(results_path, "a", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=workers) as executor:
+            while True:
+                wave = []
+                for site, urls in pending.items():
+                    if site in stop:
+                        continue
+                    room = max(1, limiter.limit[site])
+                    for _ in range(room):
+                        if cursors[site] >= len(urls):
+                            break
+                        wave.append((site, urls[cursors[site]]))
+                        cursors[site] += 1
+                if not wave:
+                    break
+                futures = [executor.submit(work, site, url) for site, url in wave]
+                for fut in as_completed(futures):
+                    row = fut.result()
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    done[(row["site"], row["url"])] = row
+                    finished += 1
+                    if finished % 50 == 0:
+                        print("checked {:,}".format(finished), file=sys.stderr, flush=True)
+                for site in pending:
+                    if site not in stop and site_done(site):
+                        stop.add(site)
+                        print("stop {} interval within {:.1%}".format(site, margin), file=sys.stderr, flush=True)
+    finally:
+        pool.close()
+    print("checked {:,}".format(finished), file=sys.stderr, flush=True)
     return done
-
-
-def wilson(alive, decided, z=1.96):
-    if decided <= 0:
-        return None
-    p = alive / decided
-    denom = 1 + z * z / decided
-    centre = p + z * z / (2 * decided)
-    margin = z * ((p * (1 - p) + z * z / (4 * decided)) / decided) ** 0.5
-    return p, max(0.0, (centre - margin) / denom), min(1.0, (centre + margin) / denom)
 
 
 def write_report(out_dir, population, done):
@@ -189,8 +413,9 @@ def write_report(out_dir, population, done):
         "# Liveness report",
         "",
         "alive = HEAD returned HTTP 200-399. dead = HTTP 404 or 410.",
-        "unknown = timeout, connection error, 403, 429 or 503. Unknown is not counted as dead,",
-        "because these sites answer with 503 when they throttle. Run the same command again to retry them.",
+        "unknown = timeout, connection error, 403, 429 or 503. Unknown is not counted as dead.",
+        "Sample sizes follow Neyman allocation (more checks where the alive rate is least certain).",
+        "A site stops early once its 95% Wilson interval is narrower than the requested margin.",
         "",
         "| website | rows in file | checked | alive | dead | unknown | alive rate | estimated alive | 95% interval |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -210,9 +435,9 @@ def write_report(out_dir, population, done):
         checked = alive + dead + unknown
         interval = wilson(alive, alive + dead)
         total_pop += pop
+        est = lo = hi = None
         if interval is None:
-            rate_text, est_text, band = "—", "—", "—"
-            est = lo = hi = None
+            rate_text, est_text, band = "-", "-", "-"
         else:
             any_estimate = True
             rate, lo_r, hi_r = interval
@@ -222,7 +447,7 @@ def write_report(out_dir, population, done):
             total_hi += hi
             rate_text = "{:.1%}".format(rate)
             est_text = "{:,.0f}".format(est)
-            band = "{:,.0f} – {:,.0f}".format(lo, hi)
+            band = "{:,.0f} - {:,.0f}".format(lo, hi)
         lines.append(
             "| {} | {:,} | {:,} | {:,} | {:,} | {:,} | {} | {} | {} |".format(
                 site, pop, checked, alive, dead, unknown, rate_text, est_text, band
@@ -239,20 +464,15 @@ def write_report(out_dir, population, done):
         }
     lines.append("")
     if any_estimate and total_pop:
-        lines.append(
-            "Estimated live URLs: **{:,.0f}** of {:,} ({:.1%}).".format(
-                total_est, total_pop, total_est / total_pop
-            )
-        )
-        lines.append("Sum of the per-site 95% intervals: {:,.0f} – {:,.0f}.".format(total_lo, total_hi))
+        lines.append("Estimated live URLs: **{:,.0f}** of {:,} ({:.1%}).".format(total_est, total_pop, total_est / total_pop))
+        lines.append("Sum of the per-site 95% intervals: {:,.0f} - {:,.0f}.".format(total_lo, total_hi))
     else:
         lines.append("No decided rows yet, so there is no estimate.")
     lines.append("")
     lines.append("The rate uses alive / (alive + dead). Unknowns are excluded, not treated as dead.")
-    lines.append("A sample estimates the file. `--per-site 0` is the only mode that checks every URL.")
-    text = "\n".join(lines) + "\n"
+    text_out = "\n".join(lines) + "\n"
     with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as fh:
-        fh.write(text)
+        fh.write(text_out)
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(
             {
@@ -265,27 +485,39 @@ def write_report(out_dir, population, done):
             ensure_ascii=False,
             indent=2,
         )
-    return text
+    return text_out
 
 
 def load_or_sample(args):
     os.makedirs(args.out, exist_ok=True)
     sample_path = os.path.join(args.out, "sample.json")
-    if os.path.exists(sample_path):
+    results_path = os.path.join(args.out, "results.jsonl")
+    if args.per_site == 0:
+        quotas = None
+    else:
+        if os.path.exists(sample_path):
+            saved = json.load(open(sample_path, encoding="utf-8"))
+            population = saved["population"]
+        else:
+            print("counting rows", file=sys.stderr, flush=True)
+            population = count_population(args.input)
+        pilot = pilot_from(load_done(results_path))
+        quotas = allocate(population, args.per_site, pilot, floor=args.floor)
+        print("allocation " + json.dumps(quotas, ensure_ascii=False), file=sys.stderr, flush=True)
+
+    if os.path.exists(sample_path) and quotas is not None:
         saved = json.load(open(sample_path, encoding="utf-8"))
-        if saved.get("per_site") != args.per_site or saved.get("seed") != args.seed:
-            raise SystemExit(
-                "existing {} was built with per-site={} seed={}. "
-                "Use that sample, or delete the output directory.".format(
-                    sample_path, saved.get("per_site"), saved.get("seed")
-                )
-            )
-        print("reusing {}".format(sample_path), file=sys.stderr)
-        return saved["population"], saved["samples"]
-    population, samples = sample_urls(args.input, args.per_site, args.seed)
+        same = saved.get("quotas") == quotas and saved.get("seed") == args.seed
+        if same:
+            print("reusing {}".format(sample_path), file=sys.stderr)
+            return saved["population"], saved["samples"]
+
+    if quotas is None:
+        quotas = {}
+    population, samples = sample_urls(args.input, quotas, args.seed)
     with open(sample_path, "w", encoding="utf-8") as fh:
         json.dump(
-            {"population": population, "samples": samples, "per_site": args.per_site, "seed": args.seed},
+            {"population": population, "samples": samples, "quotas": quotas, "per_site": args.per_site, "seed": args.seed},
             fh,
             ensure_ascii=False,
         )
@@ -297,20 +529,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="Path to the interrobang-delimited file")
     parser.add_argument("--out", default="output/liveness", help="Directory for sample, results and report")
-    parser.add_argument("--per-site", type=int, default=200, help="URLs to sample from each website (0 = every URL)")
+    parser.add_argument("--per-site", type=int, default=1000, help="Total sample budget across websites (0 = every URL)")
+    parser.add_argument("--margin", type=float, default=0.03, help="Stop a website once its 95%% interval is this narrow")
+    parser.add_argument("--floor", type=int, default=40, help="Minimum checks for a website before allocation favors the uncertain ones")
     parser.add_argument("--seed", type=int, default=20261016)
-    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--workers", type=int, default=24)
+    parser.add_argument("--connections", type=int, default=4, help="Keep-alive connections kept per origin")
     parser.add_argument("--timeout", type=float, default=12)
-    parser.add_argument("--delay", type=float, default=0.0, help="Pause inside each worker before a request, to ease throttling")
-    parser.add_argument("--passes", type=int, default=2, help="Additional retries are just another pass over rows still unknown")
+    parser.add_argument("--passes", type=int, default=2, help="Passes over rows that are still unknown")
     args = parser.parse_args()
 
     population, samples = load_or_sample(args)
-    jobs = [(site, url) for site, urls in samples.items() for url in urls]
     results_path = os.path.join(args.out, "results.jsonl")
     done = {}
     for _ in range(max(1, args.passes)):
-        done = check_all(jobs, results_path, args.workers, args.timeout, args.delay)
+        done = check_all(
+            samples,
+            results_path,
+            args.workers,
+            args.timeout,
+            args.connections,
+            args.margin,
+            full=args.per_site == 0,
+        )
         unknown = sum(1 for row in done.values() if row.get("verdict") == "unknown")
         print("unknown remaining {:,}".format(unknown), file=sys.stderr, flush=True)
         if unknown == 0:

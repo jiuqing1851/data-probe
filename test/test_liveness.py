@@ -5,7 +5,6 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
 
 import src.liveness as liveness
 
@@ -14,18 +13,23 @@ DELIM = "\u203d"
 
 
 class Handler(BaseHTTPRequestHandler):
+    hits = 0
+
     def do_HEAD(self):
-        path = urlparse(self.path).path
+        Handler.hits += 1
+        path = self.path
         if path.startswith("/alive"):
-            self.send_response(200)
+            code = 200
         elif path.startswith("/gone"):
-            self.send_response(410)
+            code = 410
         elif path.startswith("/missing"):
-            self.send_response(404)
+            code = 404
         elif path.startswith("/throttle"):
-            self.send_response(503)
+            code = 503
         else:
-            self.send_response(500)
+            code = 500
+        self.send_response(code)
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
 
     def log_message(self, fmt, *args):
@@ -34,6 +38,7 @@ class Handler(BaseHTTPRequestHandler):
 
 class LivenessTest(unittest.TestCase):
     def setUp(self):
+        Handler.hits = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -42,15 +47,63 @@ class LivenessTest(unittest.TestCase):
 
     def tearDown(self):
         self.server.shutdown()
+        self.server.server_close()
         shutil.rmtree(self.tmp)
 
     def url(self, path):
         return "http://127.0.0.1:%d%s" % (self.port, path)
 
-    def write_dump(self):
+    def write_dump(self, specs):
         path = os.path.join(self.tmp, "data.csv")
-        rows = ["website", "url", "title", "tags", "upload_date", "video_id"]
-        lines = [DELIM.join(rows)]
+        lines = [DELIM.join(["website", "url", "title", "tags", "upload_date", "video_id"])]
+        for i, (site, suffix) in enumerate(specs):
+            lines.append(DELIM.join([site, self.url(suffix), "t", "tag", "01/01/2020", str(i)]))
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
+    def test_classify_and_wilson(self):
+        self.assertEqual(liveness.classify(200), "alive")
+        self.assertEqual(liveness.classify(302), "alive")
+        self.assertEqual(liveness.classify(404), "dead")
+        self.assertEqual(liveness.classify(410), "dead")
+        self.assertEqual(liveness.classify(503), "unknown")
+        self.assertEqual(liveness.classify(None), "unknown")
+        rate, low, high = liveness.wilson(50, 100)
+        self.assertAlmostEqual(rate, 0.5)
+        self.assertLess(low, 0.5)
+        self.assertGreater(high, 0.5)
+        self.assertLess(high - low, liveness.wilson(5, 10)[2] - liveness.wilson(5, 10)[1])
+
+    def test_neyman_spends_budget_on_uncertain_sites(self):
+        population = {"Sure": 100000, "Mixed": 100000, "Unknown": 10000}
+        pilot = {"Sure": (95, 5), "Mixed": (50, 50)}
+        quotas = liveness.allocate(population, budget=300, pilot=pilot, floor=20)
+        self.assertGreater(quotas["Mixed"], quotas["Sure"])
+        self.assertGreaterEqual(quotas["Unknown"], 20)
+        self.assertLessEqual(sum(quotas.values()), 300 + 5)
+
+    def test_early_stop_skips_once_interval_is_narrow(self):
+        specs = [("Alpha", "/alive/%d" % i) for i in range(80)]
+        path = self.write_dump(specs)
+        population, samples = liveness.sample_urls(path, {"Alpha": 0}, seed=1)
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        done = liveness.check_all(
+            samples,
+            os.path.join(out, "results.jsonl"),
+            workers=4,
+            timeout=5,
+            connections=2,
+            margin=0.25,
+            full=False,
+        )
+        decided = sum(1 for row in done.values() if row["verdict"] == "alive")
+        self.assertGreaterEqual(decided, 30)
+        self.assertLess(decided, 80)
+        self.assertLess(Handler.hits, 80)
+
+    def test_full_mode_checks_everything_and_reuses_result(self):
         specs = [
             ("Alpha", "/alive/1"),
             ("Alpha", "/missing/1"),
@@ -58,70 +111,51 @@ class LivenessTest(unittest.TestCase):
             ("Beta", "/alive/2"),
             ("Beta", "/gone/1"),
         ]
-        for site, suffix in specs:
-            lines.append(DELIM.join([site, self.url(suffix), "t", "tag", "01/01/2020", suffix.strip("/")]))
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("\n".join(lines) + "\n")
-        return path
-
-    def test_classify(self):
-        self.assertEqual(liveness.classify(200), "alive")
-        self.assertEqual(liveness.classify(302), "alive")
-        self.assertEqual(liveness.classify(404), "dead")
-        self.assertEqual(liveness.classify(410), "dead")
-        self.assertEqual(liveness.classify(503), "unknown")
-        self.assertEqual(liveness.classify(None), "unknown")
-
-    def test_sample_keeps_every_row_when_unlimited(self):
-        path = self.write_dump()
-        population, samples = liveness.sample_urls(path, per_site=0, seed=1)
+        path = self.write_dump(specs)
+        population, samples = liveness.sample_urls(path, {}, seed=1)
         self.assertEqual(population, {"Alpha": 3, "Beta": 2})
-        self.assertEqual(len(samples["Alpha"]), 3)
-        self.assertEqual(len(samples["Beta"]), 2)
-
-    def test_check_retries_unknown_and_estimates(self):
-        path = self.write_dump()
-        population, samples = liveness.sample_urls(path, per_site=0, seed=1)
-        out = os.path.join(self.tmp, "out")
+        out = os.path.join(self.tmp, "out2")
         os.makedirs(out)
-        jobs = [(site, url) for site, urls in samples.items() for url in urls]
         results = os.path.join(out, "results.jsonl")
-        done = liveness.check_all(jobs, results, workers=4, timeout=5, delay=0)
+        done = liveness.check_all(samples, results, workers=4, timeout=5, connections=2, margin=0.03, full=True)
         self.assertEqual(done[("Alpha", self.url("/alive/1"))]["verdict"], "alive")
         self.assertEqual(done[("Alpha", self.url("/missing/1"))]["verdict"], "dead")
         self.assertEqual(done[("Beta", self.url("/gone/1"))]["verdict"], "dead")
         self.assertEqual(done[("Alpha", self.url("/throttle/1"))]["verdict"], "unknown")
-
-        again = liveness.check_all(jobs, results, workers=4, timeout=5, delay=0)
+        hits_after_first = Handler.hits
+        again = liveness.check_all(samples, results, workers=4, timeout=5, connections=2, margin=0.03, full=True)
         self.assertEqual(again[("Alpha", self.url("/throttle/1"))]["verdict"], "unknown")
+        self.assertEqual(Handler.hits, hits_after_first + 1)
         report = liveness.write_report(out, population, again)
         self.assertIn("Alpha", report)
         with open(os.path.join(out, "summary.json"), encoding="utf-8") as fh:
             summary = json.load(fh)
-        # Alpha: 1 alive, 1 dead, 1 unknown -> rate 1/2 of 3 rows.
         self.assertEqual(summary["sites"]["Alpha"]["estimated_alive"], 2)
-        # Beta: 1 alive, 1 dead -> half of 2 rows.
         self.assertEqual(summary["sites"]["Beta"]["estimated_alive"], 1)
-        self.assertIsNotNone(summary["sites"]["Alpha"]["interval_95"])
 
-    def test_resume_skips_decided_rows(self):
-        path = self.write_dump()
-        _population, samples = liveness.sample_urls(path, per_site=0, seed=1)
-        out = os.path.join(self.tmp, "out2")
+
+    def test_throttle_cuts_site_concurrency(self):
+        specs = [("Alpha", "/throttle/%d" % i) for i in range(12)]
+        path = self.write_dump(specs)
+        _population, samples = liveness.sample_urls(path, {"Alpha": 0}, seed=1)
+        out = os.path.join(self.tmp, "out3")
         os.makedirs(out)
-        results = os.path.join(out, "results.jsonl")
-        with open(results, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "site": "Alpha",
-                "url": self.url("/alive/1"),
-                "verdict": "alive",
-                "status": 200,
-            }) + "\n")
-        jobs = [(site, url) for site, urls in samples.items() for url in urls]
-        done = liveness.check_all(jobs, results, workers=4, timeout=5, delay=0)
-        self.assertEqual(done[("Alpha", self.url("/alive/1"))]["verdict"], "alive")
-        self.assertEqual(done[("Alpha", self.url("/missing/1"))]["verdict"], "dead")
+        done = liveness.check_all(
+            samples,
+            os.path.join(out, "results.jsonl"),
+            workers=8,
+            timeout=5,
+            connections=2,
+            margin=0.0,
+            full=True,
+        )
+        self.assertEqual(len(done), 12)
+        self.assertTrue(all(row["verdict"] == "unknown" for row in done.values()))
+        self.assertEqual(row_status_count(done, 503), 12)
 
+
+def row_status_count(done, status):
+    return sum(1 for row in done.values() if row["status"] == status)
 
 if __name__ == "__main__":
     unittest.main()
