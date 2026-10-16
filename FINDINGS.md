@@ -51,6 +51,30 @@ Identity: a deterministic 1/50 sample (473,132 keys) contained **zero** duplicat
 That is a sample, not a full exact pass. `--dup-sample 1` runs the exact set
 if memory allows (tens of millions of short strings).
 
+
+## Per website
+
+A second pass (`src/probe_by_site.py`, 487 s) splits the same checks by source.
+Missing dates are not spread evenly. They are structural.
+
+| website | rows | empty title | empty tags | missing date | bad date | date min | date max | mean tags | title mean/max | url mean/max |
+|---|---:|---:|---:|---:|---:|---|---|---:|---|---|
+| XVideos | 6,457,531 | 767 | 140,466 | 6,457,531 (100%) | 0 | — | — | 10.34 | 42.07 / 700 | 82.43 / 301 |
+| XHamster | 6,380,960 | 241 | 0 | 32 (~0%) | 0 | 2007-06-24 | 2024-08-26 | 20.82 | 32.40 / 904 | 24.16 / 30 |
+| PornHub | 5,062,490 | 32 | 26,325 | 0 | 286 | 2007-04-18 | 2024-08-27 | 10.37 | 44.11 / 150 | 61.10 / 67 |
+| Eporner | 4,146,031 | 17,270 | 94 | 4,146,031 (100%) | 0 | — | — | 9.45 | 43.21 / 253 | 88.43 / 300 |
+| DrTuber | 1,639,399 | 1 | 0 | 0 | 0 | 2009-10-24 | 2024-08-27 | 6.01 | 40.21 / 108 | 25.00 / 25 |
+
+Reading that table:
+
+- **XVideos and Eporner contribute every missing upload date.** Their date column is entirely blank (10,603,562 of the 10,603,594 blanks). The other 32 blanks are XHamster.
+- **PornHub is the only source of unparseable dates** (286 rows). Every other site is clean on the dates it actually stores.
+- **XHamster tags are much denser** (mean 20.8 per row, and no empty tag field) and its titles run the longest (max 904).
+- **DrTuber is the most regular**: one empty title, no empty tags, no missing dates, and both URL length and title length are tightly bounded (every URL is 25 characters).
+- Empty titles are concentrated on Eporner (17,270 of 18,311). Empty tag fields are concentrated on XVideos (140,466 of 166,885).
+
+So a global "44.8% of dates are missing" is the wrong summary to act on. Dates are complete for DrTuber, PornHub, and XHamster, and absent for XVideos and Eporner.
+
 ## Dates
 
 Parsed rows by year climb from a few hundred in 2007 to a peak of 1,849,147
