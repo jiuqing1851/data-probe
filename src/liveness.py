@@ -17,9 +17,12 @@ change the answer:
 
 Verdicts:
 
-    alive    HTTP 200-399
-    dead     HTTP 404 or 410
+    alive    final response is HTTP 200-399 and the final path is not the site root
+    dead     HTTP 404 or 410, or a redirect that lands on the site root
     unknown  timeout, connection error, 403, 429, 503
+
+Redirects are followed, up to 5 hops. A 200 that lands on `/` is a removed
+video whose short link now points at the homepage, so it counts as dead.
 
 Unknown is not dead. The same command again retries only those rows.
 
@@ -54,12 +57,14 @@ THROTTLE = {429, 503}
 DEAD = {404, 410}
 
 
-def classify(status):
+def classify(status, final_url=""):
     if status is None:
         return "unknown"
-    if 200 <= status < 400:
+    if 200 <= status < 300 and is_homepage(final_url):
+        return "dead"
+    if 200 <= status < 300:
         return "alive"
-    if status in DEAD:
+    if status in DEAD or status in (301, 302, 303, 307, 308):
         return "dead"
     return "unknown"
 
@@ -165,30 +170,57 @@ class ConnectionPool:
                 conn.close()
 
 
-def request_once(url, pool):
+def is_homepage(url):
+    """True when the final URL has no video path left, e.g. https://host/ or https://host."""
     parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        return None, "", 0, "BadUrl"
-    host = parts.hostname
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    target = parts.path or "/"
-    if parts.query:
-        target += "?" + parts.query
+    path = parts.path or "/"
+    return path in ("", "/") and not parts.query
+
+
+def resolve_location(current, location):
+    if not location:
+        return current
+    if location.startswith("http://") or location.startswith("https://"):
+        return location
+    parts = urlsplit(current)
+    origin = parts.scheme + "://" + parts.netloc
+    if location.startswith("/"):
+        return origin + location
+    base = parts.path.rsplit("/", 1)[0]
+    return origin + base + "/" + location
+
+
+def request_once(url, pool, hops=5):
+    """HEAD `url`, following up to `hops` redirects. Returns status, final URL, ms, error."""
+    current = url
     started = time.time()
-    conn = pool.acquire(parts.scheme, host, port)
-    reuse = False
-    try:
-        conn.request("HEAD", target, headers={"User-Agent": UA, "Accept": "text/html", "Connection": "keep-alive"})
-        resp = conn.getresponse()
-        resp.read()
-        reuse = resp.will_close is False
-        elapsed = int((time.time() - started) * 1000)
-        return int(resp.status), parts.scheme + "://" + parts.netloc + (resp.getheader("Location") or ""), elapsed, ""
-    except Exception as exc:
-        elapsed = int((time.time() - started) * 1000)
-        return None, "", elapsed, type(exc).__name__
-    finally:
-        pool.release(parts.scheme, host, port, conn, reuse)
+    for _ in range(hops + 1):
+        parts = urlsplit(current)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return None, current, int((time.time() - started) * 1000), "BadUrl"
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        target = parts.path or "/"
+        if parts.query:
+            target += "?" + parts.query
+        conn = pool.acquire(parts.scheme, host, port)
+        reuse = False
+        try:
+            conn.request("HEAD", target, headers={"User-Agent": UA, "Accept": "text/html", "Connection": "keep-alive"})
+            resp = conn.getresponse()
+            resp.read()
+            reuse = resp.will_close is False
+            status = int(resp.status)
+            location = resp.getheader("Location")
+        except Exception as exc:
+            return None, current, int((time.time() - started) * 1000), type(exc).__name__
+        finally:
+            pool.release(parts.scheme, host, port, conn, reuse)
+        if status in (301, 302, 303, 307, 308) and location:
+            current = resolve_location(current, location.strip())
+            continue
+        return status, current, int((time.time() - started) * 1000), ""
+    return None, current, int((time.time() - started) * 1000), "TooManyRedirects"
 
 
 class SiteLimiter:
@@ -361,7 +393,7 @@ def check_all(jobs, results_path, workers, timeout, connections, margin, full):
         return {
             "site": site,
             "url": url,
-            "verdict": classify(status),
+            "verdict": classify(status, final),
             "status": status,
             "final": final,
             "ms": ms,
@@ -412,7 +444,8 @@ def write_report(out_dir, population, done):
     lines = [
         "# Liveness report",
         "",
-        "alive = HEAD returned HTTP 200-399. dead = HTTP 404 or 410.",
+        "alive = the final page returned HTTP 200-299 and is not the site homepage.",
+        "dead = HTTP 404 or 410, or a redirect that ends on the homepage. A removed video often redirects there.",
         "unknown = timeout, connection error, 403, 429 or 503. Unknown is not counted as dead.",
         "Sample sizes follow Neyman allocation (more checks where the alive rate is least certain).",
         "A site stops early once its 95% Wilson interval is narrower than the requested margin.",

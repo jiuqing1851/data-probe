@@ -19,8 +19,8 @@ The file scan is cheap. Each URL still needs its own request, so the probe does 
 
 | verdict | meaning |
 |---|---|
-| alive | HEAD returned HTTP 200–399 |
-| dead | HTTP 404 or 410 |
+| alive | final response is HTTP 200–299 and the final path is not the site root |
+| dead | HTTP 404 or 410, or a redirect that lands on the homepage |
 | unknown | timeout, connection error, 403, 429, 503 |
 
 Unknown is not counted as dead. Run the same command again and only those rows are retried.

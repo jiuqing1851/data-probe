@@ -18,6 +18,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         Handler.hits += 1
         path = self.path
+        location = None
         if path.startswith("/alive"):
             code = 200
         elif path.startswith("/gone"):
@@ -26,9 +27,19 @@ class Handler(BaseHTTPRequestHandler):
             code = 404
         elif path.startswith("/throttle"):
             code = 503
+        elif path.startswith("/short"):
+            code = 302
+            location = "/alive/from-short"
+        elif path.startswith("/removed"):
+            code = 302
+            location = "/"
+        elif path == "/":
+            code = 200
         else:
             code = 500
         self.send_response(code)
+        if location:
+            self.send_header("Location", location)
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
@@ -63,11 +74,12 @@ class LivenessTest(unittest.TestCase):
         return path
 
     def test_classify_and_wilson(self):
-        self.assertEqual(liveness.classify(200), "alive")
-        self.assertEqual(liveness.classify(302), "alive")
-        self.assertEqual(liveness.classify(404), "dead")
-        self.assertEqual(liveness.classify(410), "dead")
-        self.assertEqual(liveness.classify(503), "unknown")
+        self.assertEqual(liveness.classify(200, "https://host/video/1"), "alive")
+        self.assertEqual(liveness.classify(200, "https://host/"), "dead")
+        self.assertEqual(liveness.classify(302, "https://host/video/1"), "dead")
+        self.assertEqual(liveness.classify(404, "https://host/missing"), "dead")
+        self.assertEqual(liveness.classify(410, "https://host/gone"), "dead")
+        self.assertEqual(liveness.classify(503, "https://host/video/1"), "unknown")
         self.assertEqual(liveness.classify(None), "unknown")
         rate, low, high = liveness.wilson(50, 100)
         self.assertAlmostEqual(rate, 0.5)
@@ -154,8 +166,29 @@ class LivenessTest(unittest.TestCase):
         self.assertEqual(row_status_count(done, 503), 12)
 
 
+    def test_redirect_to_video_is_alive_and_redirect_home_is_dead(self):
+        specs = [("Alpha", "/short/1"), ("Alpha", "/removed/1"), ("Alpha", "/alive/direct")]
+        path = self.write_dump(specs)
+        _population, samples = liveness.sample_urls(path, {"Alpha": 0}, seed=1)
+        out = os.path.join(self.tmp, "out4")
+        os.makedirs(out)
+        done = liveness.check_all(
+            samples,
+            os.path.join(out, "results.jsonl"),
+            workers=2,
+            timeout=5,
+            connections=2,
+            margin=0.0,
+            full=True,
+        )
+        self.assertEqual(done[("Alpha", self.url("/short/1"))]["verdict"], "alive")
+        self.assertTrue(done[("Alpha", self.url("/short/1"))]["final"].endswith("/alive/from-short"))
+        self.assertEqual(done[("Alpha", self.url("/removed/1"))]["verdict"], "dead")
+        self.assertEqual(done[("Alpha", self.url("/alive/direct"))]["verdict"], "alive")
+
 def row_status_count(done, status):
     return sum(1 for row in done.values() if row["status"] == status)
+
 
 if __name__ == "__main__":
     unittest.main()
